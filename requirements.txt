@@ -4,3 +4,4 @@ pandas
 openpyxl
 pdfplumber
 jinja2
+python-multipart
