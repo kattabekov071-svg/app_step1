@@ -213,7 +213,6 @@ def init_db():
                 created_at TEXT
             )
         ''')
-        # Проверка на админа
         cur.execute("SELECT COUNT(*) AS count FROM users")
         row = cur.fetchone()
         if row and row["count"] == 0:
@@ -223,7 +222,6 @@ def init_db():
             )
         conn.commit()
     else:
-        # SQLite
         cur = conn.cursor()
         cur.execute('''CREATE TABLE IF NOT EXISTS deals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,7 +277,6 @@ def init_db():
         conn.commit()
     conn.close()
 
-# Вызываем инициализацию
 init_db()
 
 # ==================== ЛЕНДИНГ ====================
@@ -699,13 +696,14 @@ UI_TEMPLATE = """
             </form>
         </div>
     </div>
+    <!-- Модальное окно поддержки с официальным логотипом Telegram -->
     <div id="supportModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center hidden">
         <div class="tv-panel p-6 w-full max-w-md space-y-4 shadow-2xl relative bg-[#1e222d] border border-[#2a2e39] text-[#d1d4dc]">
             <button onclick="closeSupportModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white font-bold">✕</button>
             <div>
                 <h3 class="text-sm font-bold text-white uppercase flex items-center gap-2">
                     <span>💬 Поддержка</span>
-                    <span class="text-blue-400 text-lg">✈️</span>
+                    <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/40px-Telegram_logo.svg.png" alt="Telegram" class="w-6 h-6 inline">
                 </h3>
                 <p class="text-[11px] text-gray-400">Опишите вашу проблему или вопрос. Администратор получит уведомление в Telegram.</p>
             </div>
@@ -716,7 +714,7 @@ UI_TEMPLATE = """
                 </div>
                 <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-2.5 rounded text-xs uppercase tracking-wider transition shadow flex items-center justify-center gap-2">
                     <span>Отправить в Telegram</span>
-                    <span>✈️</span>
+                    <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/40px-Telegram_logo.svg.png" alt="Telegram" class="w-5 h-5 inline">
                 </button>
             </form>
         </div>
@@ -733,7 +731,8 @@ UI_TEMPLATE = """
             <span>📍 г. Ташкент, Узбекистан</span>
             <a href="/profile" class="text-cyan-400 hover:underline">Мой профиль</a>
             <button onclick="openSupportModal()" class="text-cyan-400 hover:underline flex items-center gap-1">
-                <span>✈️</span> Поддержка
+                <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/30px-Telegram_logo.svg.png" alt="Telegram" class="w-4 h-4 inline">
+                Поддержка
             </button>
         </div>
     </footer>
@@ -1283,33 +1282,23 @@ def admin_panel(request: Request):
         return RedirectResponse(url="/", status_code=303)
     conn = get_db_connection()
     
-    # === СТАТИСТИКА (с использованием обычного курсора) ===
-    if USE_POSTGRES:
-        plain_conn = psycopg2.connect(DATABASE_URL)
-        plain_cur = plain_conn.cursor()
-    else:
-        plain_conn = conn
-        plain_cur = conn.cursor()
+    # === СТАТИСТИКА (исправленная для PostgreSQL) ===
+    cur = execute_query(conn, "SELECT COUNT(*) AS count FROM user_logs")
+    total_logs = cur.fetchone()["count"]
     
-    plain_cur.execute("SELECT COUNT(*) FROM user_logs")
-    total_logs = plain_cur.fetchone()[0]
+    cur = execute_query(conn, "SELECT COUNT(DISTINCT username) AS count FROM user_logs WHERE date(timestamp) = date('now')")
+    unique_today = cur.fetchone()["count"]
     
-    plain_cur.execute("SELECT COUNT(DISTINCT username) FROM user_logs WHERE date(timestamp) = date('now')")
-    unique_today = plain_cur.fetchone()[0]
+    cur = execute_query(conn, "SELECT COUNT(DISTINCT username) AS count FROM user_logs WHERE timestamp > datetime('now', '-7 days')")
+    unique_week = cur.fetchone()["count"]
     
-    plain_cur.execute("SELECT COUNT(DISTINCT username) FROM user_logs WHERE timestamp > datetime('now', '-7 days')")
-    unique_week = plain_cur.fetchone()[0]
+    cur = execute_query(conn, "SELECT COUNT(*) AS count FROM users WHERE role != 'admin' AND created_at > datetime('now', '-7 days')")
+    new_registrations = cur.fetchone()["count"]
     
-    plain_cur.execute("SELECT COUNT(*) FROM users WHERE role != 'admin' AND created_at > datetime('now', '-7 days')")
-    new_registrations = plain_cur.fetchone()[0]
+    cur = execute_query(conn, "SELECT COUNT(*) AS count FROM payment_requests WHERE status = 'pending'")
+    pending_payments = cur.fetchone()["count"]
     
-    plain_cur.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'")
-    pending_payments = plain_cur.fetchone()[0]
-    
-    if USE_POSTGRES:
-        plain_conn.close()
-    
-    # Остальные запросы (выборка данных) через execute_query
+    # Остальные данные
     cur = execute_query(conn, "SELECT * FROM user_logs ORDER BY timestamp DESC LIMIT 20")
     logs = cur.fetchall()
     
@@ -1324,6 +1313,7 @@ def admin_panel(request: Request):
     
     cur = execute_query(conn, "SELECT * FROM users WHERE role != 'admin' ORDER BY id DESC LIMIT 10")
     recent_users = cur.fetchall()
+    
     conn.close()
     
     rows = "".join([f"<tr class='border-t border-[#2a2e39]'><td class='p-3'>{u['filename']}</td><td class='p-3 text-cyan-400'>{u['category']}</td><td class='p-3 text-emerald-400 font-bold'>{u['rows_count']}</td><td class='p-3 text-gray-400'>{u['upload_date']}</td><td class='p-3 text-right'><form action='/admin/delete/{u['id']}' method='post'><button class='text-rose-400 hover:text-rose-300 font-bold'>Удалить</button></form></td></tr>" for u in uploads])
@@ -1340,6 +1330,7 @@ def admin_panel(request: Request):
     </tr>""" for pr in pay_requests])
     recent_rows = "".join([f"<tr class='border-t border-[#2a2e39]'><td class='p-3 text-white'>{u['username']}</td><td class='p-3 text-gray-300'>{u['email']}</td><td class='p-3 text-cyan-400'>{u['role']}</td><td class='p-3 text-gray-300'>{u['created_at']}</td></tr>" for u in recent_users])
     
+    # Компактная таблица логов
     log_rows = "".join([f"<tr class='border-t border-[#2a2e39]'><td class='py-1 px-2 text-gray-400 text-[10px]'>{log['timestamp'][:16]}</td><td class='py-1 px-2 text-white text-[10px]'>{log['username'][:12]}</td><td class='py-1 px-2 text-cyan-400 text-[10px]'>{log['action'][:10]}</td><td class='py-1 px-2 text-gray-300 text-[10px]'>{log['ip']}</td><td class='py-1 px-2 text-gray-300 text-[10px]'>{log['user_agent'][:25]}…</td></tr>" for log in logs]) or '<tr><td colspan="5" class="p-4 text-center text-gray-500">Нет записей</td></tr>'
 
     return f"""
@@ -1445,6 +1436,7 @@ def admin_panel(request: Request):
     </body>
     </html>
     """
+
 @app.post("/admin/approve_payment/{req_id}")
 def approve_payment(req_id: int, request: Request):
     user = get_current_user(request)
