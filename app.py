@@ -69,9 +69,6 @@ def execute_query(conn, query, params=None):
         cur.execute(query, params)
     return cur
 
-# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ===
-def init_db():
-    conn = get_db_connection()
     if USE_POSTGRES:
         cur = conn.cursor()
         cur.execute('''
@@ -135,8 +132,11 @@ def init_db():
                 created_at TEXT
             )
         ''')
-        cur.execute("SELECT COUNT(*) FROM users")
-        if cur.fetchone()[0] == 0:
+
+        # --- ИСПРАВЛЕННАЯ ПРОВЕРКА НА АДМИНА ---
+        cur.execute("SELECT COUNT(*) AS count FROM users")
+        row = cur.fetchone()
+        if row and row["count"] == 0:
             cur.execute(
                 "INSERT INTO users (username, email, password, role, expires_at) VALUES (%s, %s, %s, %s, %s)",
                 ("admin", "admin@xarid.uz", hash_password("tender2026"), "admin", "2099-12-31")
