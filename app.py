@@ -1,30 +1,277 @@
+import os
 import io
 import random
 import string
 import smtplib
+import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import pandas as pd
-import sqlite3
 import hashlib
 import secrets
 import uvicorn
 import requests
 from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+
+# === Настройка логирования ===
+logging.basicConfig(level=logging.DEBUG)
 
 app = FastAPI()
 
-# ==================== НАСТРОЙКИ (ЗАМЕНИТЕ НА СВОИ) ====================
+# === Конфигурация ===
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "your_email@gmail.com"
 SMTP_PASSWORD = "your_app_password"
 ADMIN_EMAIL = "admin@xarid.uz"
 
-TELEGRAM_TOKEN = "8925100564:AAH6GTe281eDfuzoyqBUBm_AhQ31edAscS8"           # ← ВСТАВЬТЕ СВОЙ ТОКЕН
-TELEGRAM_CHAT_ID = "40209048"       # ← ВСТАВЬТЕ СВОЙ CHAT ID
+TELEGRAM_TOKEN = "8925100564:AAH6GTe281eDfuzoyqBUBm_AhQ31edAscS8"           # ← вставьте свой
+TELEGRAM_CHAT_ID = "40209048"       # ← вставьте свой
+
+# === Определяем, какую БД использовать ===
+DATABASE_URL = os.environ.get("DATABASE_URL")
+USE_POSTGRES = DATABASE_URL is not None
+
+if USE_POSTGRES:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    logging.info("✅ Используется PostgreSQL")
+else:
+    import sqlite3
+    logging.info("✅ Используется SQLite (локально)")
+
+# === УНИВЕРСАЛЬНАЯ РАБОТА С БАЗОЙ ===
+def get_db_connection():
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        return conn
+    else:
+        conn = sqlite3.connect("tender.db")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+def execute_query(conn, query, params=None):
+    """Выполняет запрос с автоматической подстановкой параметров."""
+    cur = conn.cursor()
+    if params is None:
+        params = ()
+    if USE_POSTGRES:
+        query = query.replace("?", "%s")
+        cur.execute(query, params)
+    else:
+        cur.execute(query, params)
+    return cur
+
+# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ===
+def init_db():
+    conn = get_db_connection()
+    if USE_POSTGRES:
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS deals (
+                id SERIAL PRIMARY KEY,
+                category TEXT,
+                date TEXT,
+                model TEXT,
+                quantity INTEGER DEFAULT 1,
+                start_price REAL,
+                agreed_price REAL,
+                upload_id INTEGER,
+                UNIQUE(date, model, agreed_price)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS uploads (
+                id SERIAL PRIMARY KEY,
+                filename TEXT,
+                category TEXT,
+                rows_count INTEGER,
+                upload_date TEXT
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE,
+                email TEXT UNIQUE,
+                password TEXT,
+                role TEXT,
+                expires_at TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS user_logs (
+                id SERIAL PRIMARY KEY,
+                username TEXT,
+                action TEXT,
+                ip TEXT,
+                user_agent TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS password_resets (
+                id SERIAL PRIMARY KEY,
+                email TEXT,
+                token TEXT,
+                expires_at TEXT
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id SERIAL PRIMARY KEY,
+                username TEXT,
+                months INTEGER,
+                receipt TEXT,
+                status TEXT,
+                created_at TEXT
+            )
+        ''')
+        cur.execute("SELECT COUNT(*) FROM users")
+        if cur.fetchone()[0] == 0:
+            cur.execute(
+                "INSERT INTO users (username, email, password, role, expires_at) VALUES (%s, %s, %s, %s, %s)",
+                ("admin", "admin@xarid.uz", hash_password("tender2026"), "admin", "2099-12-31")
+            )
+        conn.commit()
+    else:
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS deals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT, date TEXT, model TEXT,
+            quantity INTEGER,
+            start_price REAL, agreed_price REAL,
+            upload_id INTEGER,
+            UNIQUE(date, model, agreed_price)
+        )''')
+        cur.execute("PRAGMA table_info(deals)")
+        columns = [col[1] for col in cur.fetchall()]
+        if 'quantity' not in columns:
+            cur.execute("ALTER TABLE deals ADD COLUMN quantity INTEGER DEFAULT 1")
+        cur.execute('''CREATE TABLE IF NOT EXISTS uploads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT, category TEXT, rows_count INTEGER, upload_date TEXT
+        )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            email TEXT UNIQUE,
+            password TEXT,
+            role TEXT,
+            expires_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS user_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            action TEXT,
+            ip TEXT,
+            user_agent TEXT,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS password_resets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT,
+            token TEXT,
+            expires_at TEXT
+        )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS payment_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            months INTEGER,
+            receipt TEXT,
+            status TEXT,
+            created_at TEXT
+        )''')
+        cur.execute("SELECT COUNT(*) FROM users")
+        if cur.fetchone()[0] == 0:
+            cur.execute("INSERT INTO users (username, email, password, role, expires_at) VALUES (?, ?, ?, ?, ?)",
+                       ("admin", "admin@xarid.uz", hash_password("tender2026"), "admin", "2099-12-31"))
+        conn.commit()
+    conn.close()
+
+init_db()
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120000)
+    return f"pbkdf2_sha256$120000${salt}${digest.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        scheme, iterations, salt, digest = stored.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return secrets.compare_digest(password, stored)
+        check = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iterations))
+        return secrets.compare_digest(check.hex(), digest)
+    except Exception:
+        return False
+
+def send_email(to_email: str, subject: str, body: str):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_USER
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        if SMTP_USER == "your_email@gmail.com" and SMTP_PASSWORD == "your_app_password":
+            print(f"\n[DEBUG EMAIL] To: {to_email}\nSubject: {subject}\nBody:\n{body}\n")
+            return True
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, to_email, msg.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки почты: {e}")
+        return False
+
+def send_telegram(message: str):
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "ваш_токен":
+        print("⚠️ Telegram не настроен: токен не задан.")
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        response = requests.post(url, json=payload)
+        print(f"📨 Telegram ответ: {response.status_code} - {response.text}")
+        return response.status_code == 200
+    except Exception as e:
+        print(f"❌ Ошибка отправки в Telegram: {e}")
+        return False
+
+def send_admin_notification(subject: str, body: str):
+    send_telegram(f"🔔 <b>{subject}</b>\n\n{body}")
+    send_email(ADMIN_EMAIL, subject, body)
+
+def log_action(username: str, action: str, request: Request):
+    try:
+        conn = get_db_connection()
+        ip = request.client.host if request.client else "unknown"
+        user_agent = request.headers.get("user-agent", "unknown")
+        execute_query(conn,
+            "INSERT INTO user_logs (username, action, ip, user_agent) VALUES (?, ?, ?, ?)",
+            (username, action, ip, user_agent)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка логирования: {e}")
+
+def get_current_user(request: Request):
+    session_user = request.cookies.get("session_user")
+    if not session_user:
+        return None
+    conn = get_db_connection()
+    cur = execute_query(conn, "SELECT * FROM users WHERE username = ?", (session_user,))
+    user = cur.fetchone()
+    conn.close()
+    return user
 
 # ==================== ЛЕНДИНГ ====================
 LANDING_TEMPLATE = """
@@ -37,7 +284,6 @@ LANDING_TEMPLATE = """
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         body { background-color: #0d1117; color: #c9d1d9; min-height: 100vh; display: flex; flex-direction: column; padding: 16px; }
-
         .app-header { max-width: 1600px; width: 100%; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; gap: 20px; flex-wrap: wrap; }
         .app-logo-area { display: flex; align-items: center; gap: 14px; }
         .logo-icon { width: 38px; height: 38px; background: linear-gradient(135deg, #00b4d8, #0077b6); border: 2px solid #00f5ff; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #ffffff; font-weight: 800; font-size: 1.1rem; box-shadow: 0 0 12px rgba(0, 245, 255, 0.4); }
@@ -49,19 +295,16 @@ LANDING_TEMPLATE = """
         .header-btn-outline:hover { background: #30363d; }
         .header-btn-primary { background: #0077b6; border: 1px solid #0096c7; color: #ffffff; padding: 6px 14px; border-radius: 6px; font-size: 0.78rem; font-weight: 600; cursor: pointer; text-decoration: none; transition: 0.2s; }
         .header-btn-primary:hover { background: #0096c7; }
-
         .controls-bar { max-width: 1600px; width: 100%; margin: 12px auto 0 auto; display: flex; flex-direction: column; gap: 10px; background: #161b22; border: 1px solid #30363d; padding: 12px 16px; border-radius: 8px; }
         .categories-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
         .categories-label { font-size: 0.75rem; color: #8b949e; font-weight: 600; text-transform: uppercase; margin-right: 4px; }
         .cat-btn { background: #0d1117; border: 1px solid #30363d; color: #8b949e; padding: 6px 14px; border-radius: 6px; font-size: 0.78rem; font-weight: 500; cursor: pointer; transition: 0.2s; }
         .cat-btn:hover { background: #21262d; color: #ffffff; border-color: #484f58; }
         .cat-btn.active { border-color: #00c2ff; color: #00c2ff; background: rgba(0, 194, 255, 0.1); }
-
         .search-box { position: relative; width: 100%; }
         .search-input { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 12px 8px 34px; border-radius: 6px; font-size: 0.8rem; outline: none; transition: border-color 0.2s; }
         .search-input:focus { border-color: #00c2ff; }
         .search-icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: #484f58; font-size: 0.8rem; }
-
         .app-layout { max-width: 1600px; width: 100%; margin: 12px auto; display: flex; flex-direction: column; flex-grow: 1; }
         .table-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
         .data-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.8rem; }
@@ -69,42 +312,15 @@ LANDING_TEMPLATE = """
         .data-table th { background: #161b22; color: #8b949e; font-weight: 600; text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.5px; border-bottom: 2px solid #21262d; }
         .data-table tbody tr { cursor: pointer; transition: background 0.1s; }
         .data-table tbody tr:hover { background: #21262d; }
-
-        @keyframes slideDown {
-            0% { opacity: 0; transform: translateY(-10px); background-color: rgba(0, 194, 255, 0.15); }
-            100% { opacity: 1; transform: translateY(0); background-color: transparent; }
-        }
+        @keyframes slideDown { 0% { opacity: 0; transform: translateY(-10px); background-color: rgba(0, 194, 255, 0.15); } 100% { opacity: 1; transform: translateY(0); background-color: transparent; } }
         .smooth-new-row { animation: slideDown 0.6s ease-out forwards; }
-
         .col-cat { color: #58a6ff; font-weight: 500; font-size: 0.78rem; }
         .col-model { color: #f0f6fc; font-weight: 600; }
         .price-old { color: #8b949e; font-family: monospace; }
         .price-new { color: #3fb950; font-weight: 600; font-family: monospace; }
         .contracts-count { color: #8b949e; font-size: 0.75rem; text-align: right; }
-
-        .modal-overlay {
-            display: none;
-            position: fixed;
-            top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(13, 17, 23, 0.85);
-            backdrop-filter: blur(4px);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-        }
-        .modal-card {
-            background: #161b22;
-            border: 1px solid #30363d;
-            padding: 24px;
-            border-radius: 8px;
-            width: 100%;
-            max-width: 380px;
-            box-shadow: 0 15px 30px rgba(0,0,0,0.6);
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-            position: relative;
-        }
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(13, 17, 23, 0.85); backdrop-filter: blur(4px); z-index: 1000; justify-content: center; align-items: center; }
+        .modal-card { background: #161b22; border: 1px solid #30363d; padding: 24px; border-radius: 8px; width: 100%; max-width: 380px; box-shadow: 0 15px 30px rgba(0,0,0,0.6); display: flex; flex-direction: column; gap: 14px; position: relative; }
         .modal-title { font-size: 1.05rem; font-weight: 700; color: #f0f6fc; }
         .modal-desc { font-size: 0.8rem; color: #8b949e; line-height: 1.4; }
         .modal-close { position: absolute; top: 12px; right: 12px; background: none; border: none; font-size: 1.2rem; cursor: pointer; color: #8b949e; }
@@ -119,7 +335,6 @@ LANDING_TEMPLATE = """
     </style>
 </head>
 <body>
-
     <div class="app-header">
         <div class="app-logo-area">
             <div class="logo-icon">X</div>
@@ -133,7 +348,6 @@ LANDING_TEMPLATE = """
             <button class="header-btn-primary" onclick="openLoginModal()">Войти</button>
         </div>
     </div>
-
     <div class="controls-bar">
         <div class="categories-row" id="categoryButtons">
             <span class="categories-label">Категории:</span>
@@ -148,25 +362,14 @@ LANDING_TEMPLATE = """
             <input type="text" id="searchInput" class="search-input" placeholder="Быстрый поиск по модели оборудования..." onclick="openLoginModal()">
         </div>
     </div>
-
     <div class="app-layout">
         <div class="table-card">
             <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>Категория</th>
-                        <th>Модель оборудования</th>
-                        <th>Стартовая цена (мин)</th>
-                        <th>Цена договора (мин)</th>
-                        <th style="text-align: right;">Контракты</th>
-                    </tr>
-                </thead>
-                <tbody id="dealsTbody" onclick="openLoginModal()">
-                </tbody>
+                <thead><tr><th>Категория</th><th>Модель оборудования</th><th>Стартовая цена (мин)</th><th>Цена договора (мин)</th><th style="text-align: right;">Контракты</th></tr></thead>
+                <tbody id="dealsTbody" onclick="openLoginModal()"></tbody>
             </table>
         </div>
     </div>
-
     <!-- Модалки -->
     <div class="modal-overlay" id="loginModal">
         <div class="modal-card">
@@ -183,7 +386,6 @@ LANDING_TEMPLATE = """
             </form>
         </div>
     </div>
-
     <div class="modal-overlay" id="registerModal">
         <div class="modal-card">
             <button class="modal-close" onclick="closeRegisterModal()">&times;</button>
@@ -197,7 +399,6 @@ LANDING_TEMPLATE = """
             </form>
         </div>
     </div>
-
     <div class="modal-overlay" id="forgotModal">
         <div class="modal-card">
             <button class="modal-close" onclick="closeForgotModal()">&times;</button>
@@ -209,7 +410,6 @@ LANDING_TEMPLATE = """
             </form>
         </div>
     </div>
-
     <script>
         function openLoginModal() { document.getElementById('loginModal').style.display = 'flex'; }
         function closeLoginModal() { document.getElementById('loginModal').style.display = 'none'; }
@@ -217,13 +417,11 @@ LANDING_TEMPLATE = """
         function closeRegisterModal() { document.getElementById('registerModal').style.display = 'none'; }
         function openForgotModal() { document.getElementById('forgotModal').style.display = 'flex'; }
         function closeForgotModal() { document.getElementById('forgotModal').style.display = 'none'; }
-
         window.addEventListener('click', function(event) {
             if (event.target.classList.contains('modal-overlay')) {
                 event.target.style.display = 'none';
             }
         });
-
         const demoDeals = [
             { cat: "Принтеры", catKey: "printer", model: "3200", start: "3 000 000 UZS", deal: "2 020 000 UZS", count: "Контрактов: 2 ▼" },
             { cat: "Принтеры", catKey: "printer", model: "Canon LBP-2900", start: "2 000 000 UZS", deal: "1 600 000,01 UZS", count: "Контрактов: 17 ▼" },
@@ -233,7 +431,6 @@ LANDING_TEMPLATE = """
             { cat: "Регистратор (NVR)", catKey: "nvr", model: "Видеорегистратор Dahua NVR4104-4KS2/L", start: "6 800 000 UZS", deal: "6 200 000 UZS", count: "Контрактов: 19 ▼" },
             { cat: "Ноутбук", catKey: "laptop", model: "Ноутбук HP ProBook 450 G9 i5 / 16GB", start: "92 000 000 UZS", deal: "84 500 000 UZS", count: "Контрактов: 8 ▼" }
         ];
-
         const livePool = [
             { cat: "Принтеры", catKey: "printer", model: "Epson L3210", start: "1 000 000 UZS", deal: "999 999 UZS", count: "Контрактов: 87 ▼" },
             { cat: "Принтеры", catKey: "printer", model: "Epson L3200", start: "2 100 000 UZS", deal: "1 904 000 UZS", count: "Контрактов: 42 ▼" },
@@ -241,9 +438,7 @@ LANDING_TEMPLATE = """
             { cat: "Регистратор (NVR)", catKey: "nvr", model: "Видеорегистратор HiWatch DS-N304", start: "5 200 000 UZS", deal: "4 800 000 UZS", count: "Контрактов: 23 ▼" },
             { cat: "Ноутбук", catKey: "laptop", model: "Ноутбук Acer Aspire 3 i3 / 8GB", start: "54 000 000 UZS", deal: "49 500 000 UZS", count: "Контрактов: 12 ▼" }
         ];
-
         let activeCategory = 'all';
-
         function renderTable(data) {
             const tbody = document.getElementById('dealsTbody');
             tbody.innerHTML = '';
@@ -263,9 +458,7 @@ LANDING_TEMPLATE = """
                 tbody.appendChild(tr);
             });
         }
-
         renderTable(demoDeals);
-
         document.querySelectorAll('.cat-btn').forEach(btn => {
             btn.addEventListener('click', function(e) {
                 e.stopPropagation();
@@ -283,7 +476,6 @@ LANDING_TEMPLATE = """
                 });
             });
         });
-
         function addNewLiveRow() {
             const tbody = document.getElementById('dealsTbody');
             const randomItem = livePool[Math.floor(Math.random() * livePool.length)];
@@ -305,7 +497,6 @@ LANDING_TEMPLATE = """
                 tbody.deleteRow(tbody.rows.length - 1);
             }
         }
-
         setInterval(addNewLiveRow, 4000);
     </script>
 </body>
@@ -347,7 +538,6 @@ UI_TEMPLATE = """
     </style>
 </head>
 <body class="min-h-screen flex flex-col p-4 max-w-[1600px] mx-auto gap-4 justify-between">
-    
     <div class="flex flex-col gap-4 flex-1">
         <header class="tv-panel px-5 py-3.5 flex flex-col gap-3 shadow-xl bg-gradient-to-r from-[#1e222d] via-[#1a1f2c] to-[#1e222d]">
             <div class="flex justify-between items-center">
@@ -358,7 +548,6 @@ UI_TEMPLATE = """
                         <span class="text-[10px] text-cyan-400 font-medium">Мониторинг тендеров xarid.uzex.uz</span>
                     </div>
                 </div>
-
                 <div class="flex gap-3.5 items-center">
                     <div class="flex items-center gap-1.5" id="langContainer">
                         <button onclick="setLanguage('ru')" class="lang-btn active" id="lang-ru">RU</button>
@@ -371,32 +560,27 @@ UI_TEMPLATE = """
                     <div id="authHeaderBlock" class="flex items-center gap-2"></div>
                 </div>
             </div>
-            
             <div class="marquee-container text-xs text-gray-300 border-t border-[#2a2e39] pt-2">
                 <div class="marquee-track" id="ratesMarqueeTrack"><span class="text-cyan-400">Загрузка курса USD...</span></div>
             </div>
         </header>
-
         <div id="paymentPendingBanner" class="bg-gradient-to-r from-amber-950/40 via-yellow-950/30 to-[#1e222d] border border-yellow-500/30 p-4 rounded-lg flex justify-between items-center hidden">
             <div class="flex items-center gap-3">
                 <span class="text-xl">💳</span>
                 <div>
                     <h4 class="text-xs font-bold text-yellow-400 uppercase tracking-wider">Подписка не активна: Цены скрыты</h4>
-                    <p class="text-[11px] text-gray-300">
+                    <p class="text-[11px] text-gray-300">Переведите <b>200,000 UZS</b> на карту Humo <b class="text-white font-mono">9860 1701 0525 9973</b> (B.K.) и отправьте чек.</p>
                 </div>
             </div>
-            <div><button onclick="openPaymentModal()" class="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded text-xs font-bold transition shadow">Купить подписку 🧾</button></div>
+            <div><button onclick="openPaymentModal()" class="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded text-xs font-bold transition shadow">Отправить чек об оплате 🧾</button></div>
         </div>
-
         <div class="tv-panel p-3 flex items-center gap-2 overflow-x-auto">
             <span class="text-[11px] font-bold uppercase text-gray-400 mr-2 shrink-0" id="catLabelText">Категории:</span>
             <div class="flex items-center gap-1.5 overflow-x-auto" id="headerCategoriesContainer"></div>
         </div>
-
         <div class="tv-panel p-3">
             <input type="text" id="searchInput" oninput="applyFilters()" placeholder="🔎 Быстрый поиск по модели оборудования..." class="w-full px-3.5 py-2 rounded text-xs outline-none focus:border-cyan-500 transition border">
         </div>
-
         <div class="tv-panel overflow-hidden flex-1 flex flex-col">
             <div class="grid grid-cols-4 px-4 py-2 bg-[#151922] border-b border-[#2a2e39] text-[10px] font-bold uppercase text-gray-400 tracking-wider">
                 <div id="thCat">Категория</div>
@@ -407,7 +591,6 @@ UI_TEMPLATE = """
             <div class="divide-y divide-[#2a2e39] overflow-y-auto max-h-[550px]" id="dealsContainer"></div>
         </div>
     </div>
-
     <!-- Модальные окна -->
     <div id="loginModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center hidden">
         <div class="tv-panel p-6 w-full max-w-md space-y-4 shadow-2xl relative">
@@ -432,7 +615,6 @@ UI_TEMPLATE = """
             </form>
         </div>
     </div>
-
     <div id="forgotModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center hidden">
         <div class="tv-panel p-6 w-full max-w-md space-y-4 shadow-2xl relative">
             <button onclick="closeForgotModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white font-bold">✕</button>
@@ -449,7 +631,6 @@ UI_TEMPLATE = """
             </form>
         </div>
     </div>
-
     <div id="registerModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center hidden">
         <div class="tv-panel p-6 w-full max-w-md space-y-4 shadow-2xl relative">
             <button onclick="closeRegisterModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white font-bold">✕</button>
@@ -474,7 +655,6 @@ UI_TEMPLATE = """
             </form>
         </div>
     </div>
-
     <div id="paymentModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center hidden">
         <div class="tv-panel p-6 w-full max-w-md space-y-4 shadow-2xl relative bg-[#1e222d] border border-[#2a2e39] text-[#d1d4dc]">
             <button onclick="closePaymentModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white font-bold">✕</button>
@@ -510,25 +690,28 @@ UI_TEMPLATE = """
             </form>
         </div>
     </div>
-
-    <!-- Модальное окно поддержки -->
     <div id="supportModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center hidden">
         <div class="tv-panel p-6 w-full max-w-md space-y-4 shadow-2xl relative bg-[#1e222d] border border-[#2a2e39] text-[#d1d4dc]">
             <button onclick="closeSupportModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white font-bold">✕</button>
             <div>
-                <h3 class="text-sm font-bold text-white uppercase">💬 Поддержка</h3>
-                <p class="text-[11px] text-gray-400">Опишите вашу проблему или вопрос. Администратор получит уведомление.</p>
+                <h3 class="text-sm font-bold text-white uppercase flex items-center gap-2">
+                    <span>💬 Поддержка</span>
+                    <span class="text-blue-400 text-lg">✈️</span>
+                </h3>
+                <p class="text-[11px] text-gray-400">Опишите вашу проблему или вопрос. Администратор получит уведомление в Telegram.</p>
             </div>
             <form action="/api/support" method="POST" class="space-y-3">
                 <div>
                     <label class="block text-[10px] font-bold uppercase text-gray-400 mb-1">Сообщение</label>
                     <textarea name="message" required rows="4" class="w-full px-3 py-2 rounded text-xs outline-none focus:border-cyan-500 transition border bg-[#131722] border-[#2a2e39] text-white" placeholder="Опишите вашу проблему..."></textarea>
                 </div>
-                <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-2.5 rounded text-xs uppercase tracking-wider transition shadow">Отправить ✉️</button>
+                <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-2.5 rounded text-xs uppercase tracking-wider transition shadow flex items-center justify-center gap-2">
+                    <span>Отправить в Telegram</span>
+                    <span>✈️</span>
+                </button>
             </form>
         </div>
     </div>
-
     <footer class="tv-panel px-6 py-4 mt-4 text-xs text-gray-400 flex flex-col md:flex-row justify-between items-center gap-4 border-t border-[#2a2e39]">
         <div class="flex flex-col gap-1 text-center md:text-left">
             <div class="text-white font-bold tracking-wider flex items-center gap-2 justify-center md:justify-start">
@@ -539,35 +722,22 @@ UI_TEMPLATE = """
         </div>
         <div class="flex flex-wrap justify-center gap-6 text-[11px]">
             <span>📍 г. Ташкент, Узбекистан</span>
-            
+            <a href="/profile" class="text-cyan-400 hover:underline">Мой профиль</a>
             <button onclick="openSupportModal()" class="text-cyan-400 hover:underline flex items-center gap-1">
-    <span><img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/40px-Telegram_logo.svg.png" alt="Telegram" class="w-5 h-5 inline"></span> Поддержка
-</button>
+                <span>✈️</span> Поддержка
+            </button>
         </div>
     </footer>
-
     <script>
-        let allDeals = []; 
-        let usdRate = 11820; 
-        let isUsd = false;
-        let isAuthorized = false;
-        let isSubActive = false;
-        let expandedModelKey = null;
-        let selectedCategory = '';
-        let currentLang = 'ru';
-
+        let allDeals = []; let usdRate = 11820; let isUsd = false; let isAuthorized = false; let isSubActive = false; let expandedModelKey = null; let selectedCategory = ''; let currentLang = 'ru';
         const i18n = {
             ru: { searchPlaceholder: "🔎 Быстрый поиск по модели оборудования...", catAll: "Все", categoriesTitle: "Категории:", thCat: "Категория", thModel: "Модель оборудования", thStartPrice: "Стартовая цена (Мин)", thAgreedPrice: "Цена договора (Мин)", contractsCount: "Контрактов:", detailsTitle: "Деталика по модели:", btnUsd: "💱 Цена в USD", btnUzs: "💱 Цена в UZS", targetWin: "🏆 Рекомендуемая цена для победы (-1% от минимума):", givePrice: "⚡ Предложить цену", currencyLabel: "Валюта", thDate: "Дата", thQty: "Кол-во", noData: "Ничего не найдено или база пуста.", hiddenPriceText: "🔒 Нужна активная подписка", showAll: "Показать все", hideAll: "Скрыть" },
             en: { searchPlaceholder: "🔎 Quick search by equipment model...", catAll: "All", categoriesTitle: "Categories:", thCat: "Category", thModel: "Equipment Model", thStartPrice: "Starting Price (Min)", thAgreedPrice: "Contract Price (Min)", contractsCount: "Contracts:", detailsTitle: "Details for model:", btnUsd: "💱 Price in USD", btnUzs: "💱 Price in UZS", targetWin: "🏆 Recommended winning price (-1% from minimum):", givePrice: "⚡ Place bid", currencyLabel: "Currency", thDate: "Date", thQty: "Qty", noData: "Nothing found or database is empty.", hiddenPriceText: "🔒 Active subscription required", showAll: "Show all", hideAll: "Hide" },
             uz: { searchPlaceholder: "🔎 Jihoz modeli bo'yicha tezkor qidiruv...", catAll: "Barchasi", categoriesTitle: "Kategoriyalar:", thCat: "Kategoriya", thModel: "Jihoz modeli", thStartPrice: "Boshlang'ich narx (Min)", thAgreedPrice: "Shartnoma narxi (Min)", contractsCount: "Shartnomalar:", detailsTitle: "Model tafsilotlari:", btnUsd: "💱 USD narxi", btnUzs: "💱 UZS narxi", targetWin: "🏆 G'alaba uchun tavsiya etilgan narx (minimumdan -1%):", givePrice: "⚡ Narx berish", currencyLabel: "Valyuta", thDate: "Sana", thQty: "Soni", noData: "Hech narsa topilmadi yoki baza bo'sh.", hiddenPriceText: "🔒 Faol obuna talab etiladi", showAll: "Hammasini ko'rsat", hideAll: "Yopish" }
         };
-
         function setLanguage(lang) {
             currentLang = lang;
-            ['ru', 'en', 'uz'].forEach(l => {
-                let btn = document.getElementById('lang-' + l);
-                if(l === lang) btn.classList.add('active'); else btn.classList.remove('active');
-            });
+            ['ru','en','uz'].forEach(l => { let btn = document.getElementById('lang-'+l); if(l===lang) btn.classList.add('active'); else btn.classList.remove('active'); });
             document.getElementById('searchInput').placeholder = i18n[currentLang].searchPlaceholder;
             document.getElementById('catLabelText').innerText = i18n[currentLang].categoriesTitle;
             document.getElementById('thCat').innerText = i18n[currentLang].thCat;
@@ -578,7 +748,6 @@ UI_TEMPLATE = """
             renderHeaderCategories(allDeals);
             applyFilters();
         }
-
         function openLoginModal() { document.getElementById('loginModal').classList.remove('hidden'); }
         function closeLoginModal() { document.getElementById('loginModal').classList.add('hidden'); }
         function openForgotModal() { document.getElementById('forgotModal').classList.remove('hidden'); }
@@ -589,40 +758,35 @@ UI_TEMPLATE = """
         function closePaymentModal() { document.getElementById('paymentModal').classList.add('hidden'); }
         function openSupportModal() { document.getElementById('supportModal').classList.remove('hidden'); }
         function closeSupportModal() { document.getElementById('supportModal').classList.add('hidden'); }
-
-        async function load() { 
+        async function load() {
             try {
                 let res = await fetch('https://cbu.uz/ru/arkhiv-kursov-valyut/json/');
                 let data = await res.json();
                 let usdObj = data.find(item => item.Code === '840');
                 if (usdObj) usdRate = parseFloat(usdObj.Rate);
-
                 let ratesHtml = '';
                 if (usdObj) {
                     let diffColor = parseFloat(usdObj.Diff) >= 0 ? 'text-emerald-400' : 'text-rose-400';
                     let sign = parseFloat(usdObj.Diff) > 0 ? '+' : '';
-                    for(let i = 0; i < 4; i++) {
+                    for(let i=0; i<4; i++) {
                         ratesHtml += `<span class="inline-flex items-center gap-2 font-mono"><span class="font-bold text-white text-[13px]">USD</span>: <span class="text-cyan-300 font-semibold">${parseFloat(usdObj.Rate).toLocaleString()} UZS</span> <span class="${diffColor} text-[11px]">(${sign}${usdObj.Diff})</span><span class="text-gray-400 text-[11px] ml-1">от ${usdObj.Date}</span></span> <span class="text-gray-600 mx-3">|</span> `;
                     }
                 }
                 document.getElementById('ratesMarqueeTrack').innerHTML = ratesHtml;
-            } catch(e) { 
+            } catch(e) {
                 document.getElementById('ratesMarqueeTrack').innerHTML = `<span class="text-gray-400">Курс ЦБ временно недоступен</span>`;
             }
-
             let authRes = await fetch('/api/check_auth');
             let authData = await authRes.json();
             isAuthorized = authData.authenticated;
             isSubActive = authData.sub_active;
             let role = authData.role; window.userRole = role;
-
             let authHeaderHtml = '';
             if (isAuthorized) {
                 authHeaderHtml += `<a href="/profile" class="bg-gray-700/30 hover:bg-gray-700/50 text-gray-300 px-3 py-1.5 rounded text-xs font-bold transition flex items-center gap-1.5">👤 ${authData.username}</a>`;
                 if (role === 'admin') {
                     authHeaderHtml += `<a href="/admin" class="bg-rose-500/10 border border-rose-500/30 hover:bg-rose-500/20 text-rose-400 px-3 py-1.5 rounded text-xs font-bold transition flex items-center gap-1"><span>🔒</span> Admin</a>`;
                 }
-                
                 if (!isSubActive && role !== 'admin') {
                     document.getElementById('paymentPendingBanner').classList.remove('hidden');
                     authHeaderHtml += `<div class="bg-amber-500/10 border border-amber-500/30 text-amber-400 px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1.5"><span>⏳ Подписка не активна</span></div>`;
@@ -633,20 +797,17 @@ UI_TEMPLATE = """
                     let badgeColor = daysLeft <= 3 ? 'bg-rose-500/10 border-rose-500/30 text-rose-400' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400';
                     authHeaderHtml += `<div class="${badgeColor} border px-3 py-1.5 rounded text-xs font-semibold flex items-center gap-1.5"><span>📅 До ${authData.expires_at} (${daysLeft} дн.)</span></div>`;
                 }
-
                 authHeaderHtml += `<a href="/logout" class="bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded text-xs font-bold transition">Выйти</a>`;
             } else {
                 window.location.href = '/';
                 return;
             }
             document.getElementById('authHeaderBlock').innerHTML = authHeaderHtml;
-
-            let dealsRes = await fetch('/api/deals'); 
-            allDeals = await dealsRes.json(); 
+            let dealsRes = await fetch('/api/deals');
+            allDeals = await dealsRes.json();
             renderHeaderCategories(allDeals);
-            applyFilters(); 
+            applyFilters();
         }
-
         function renderHeaderCategories(deals) {
             let cats = [...new Set(deals.map(d => d.category).filter(Boolean))];
             let allText = i18n[currentLang].catAll;
@@ -657,46 +818,21 @@ UI_TEMPLATE = """
             });
             document.getElementById('headerCategoriesContainer').innerHTML = html;
         }
-
-        function filterByCategory(cat) {
-            selectedCategory = cat;
-            expandedModelKey = null;
-            renderHeaderCategories(allDeals);
-            applyFilters();
-        }
-
-        function resetToHome() {
-            selectedCategory = '';
-            document.getElementById('searchInput').value = '';
-            expandedModelKey = null;
-            renderHeaderCategories(allDeals);
-            applyFilters();
-        }
-
-        function toggleCurrency() { 
-            isUsd = !isUsd; 
-            document.getElementById('currencyBtnText').innerText = isUsd ? 'UZS' : 'USD';
-            applyFilters(); 
-        }
-
-        function canSeeData() {
-            return isAuthorized && (isSubActive || window.userRole === 'admin');
-        }
-
+        function filterByCategory(cat) { selectedCategory = cat; expandedModelKey = null; renderHeaderCategories(allDeals); applyFilters(); }
+        function resetToHome() { selectedCategory = ''; document.getElementById('searchInput').value = ''; expandedModelKey = null; renderHeaderCategories(allDeals); applyFilters(); }
+        function toggleCurrency() { isUsd = !isUsd; document.getElementById('currencyBtnText').innerText = isUsd ? 'UZS' : 'USD'; applyFilters(); }
+        function canSeeData() { return isAuthorized && (isSubActive || window.userRole === 'admin'); }
         function fmt(val) {
             if (!canSeeData()) return i18n[currentLang].hiddenPriceText;
             if (!val || val <= 0) return '—';
             return isUsd ? Number(val / usdRate).toLocaleString(undefined, {maximumFractionDigits: 2}) + ' $' : Number(val).toLocaleString() + ' UZS';
         }
-
         function fmtUsdOnly(val) {
             if (!canSeeData()) return i18n[currentLang].hiddenPriceText;
             if (!val || val <= 0) return '—';
             return Number(val / usdRate).toLocaleString(undefined, {maximumFractionDigits: 2}) + ' $';
         }
-
         let fullDealsMap = {};
-
         function renderTable(deals) {
             let groupedMap = {};
             deals.forEach(d => {
@@ -704,7 +840,6 @@ UI_TEMPLATE = """
                 if(!groupedMap[mKey]) groupedMap[mKey] = {model: d.model, category: d.category, dealsList: []};
                 groupedMap[mKey].dealsList.push(d);
             });
-
             let html = '';
             Object.values(groupedMap).forEach(item => {
                 let mKey = (item.model || "").trim().toLowerCase();
@@ -715,11 +850,9 @@ UI_TEMPLATE = """
                 let minStart = startPrices.length ? Math.min(...startPrices) : 0;
                 let targetPrice = minAgreed * 0.99;
                 let t = i18n[currentLang];
-
                 let startPriceDisplay = fmt(minStart);
                 let agreedPriceDisplay = fmt(minAgreed);
                 let blurClass = !canSeeData() ? 'blur-price text-gray-500' : '';
-
                 html += `<div>
                     <div onclick="toggleRow('${item.model.replace(/'/g, '\\\'')}')" class="grid grid-cols-4 items-center cursor-pointer row-hover transition compact-row ${isExp ? 'bg-cyan-600/10 border-l-4 border-cyan-500' : ''}">
                         <div class="text-cyan-400 font-semibold truncate pr-2">${item.category || '—'}</div>
@@ -730,16 +863,13 @@ UI_TEMPLATE = """
                             <span class="text-[10px] text-gray-500 font-normal">${t.contractsCount} ${item.dealsList.length} ▼</span>
                         </div>
                     </div>`;
-                
                 if(isExp) {
                     let modalId = 'sub_' + mKey.replace(/[^a-z0-9]/g, '_');
                     fullDealsMap[modalId] = item.dealsList;
-
                     let sortedDeals = item.dealsList.slice().sort((a,b) => new Date(b.date) - new Date(a.date));
                     let showCount = 5;
                     let limitedDeals = sortedDeals.slice(0, showCount);
                     let moreCount = sortedDeals.length - showCount;
-
                     html += `<div class="tv-subpanel border-t border-[#2a2e39] bg-[#141720] compact-detail">
                         <div class="tv-panel p-2 rounded space-y-1.5">
                             <div class="flex justify-between items-center">
@@ -748,7 +878,6 @@ UI_TEMPLATE = """
                         html += `<button onclick="event.stopPropagation(); toggleSubCurrency('${modalId}')" id="${modalId}_btn" class="bg-cyan-600/20 border border-cyan-500/40 text-cyan-300 px-2 py-0.5 rounded text-[9px] font-bold transition">${t.btnUsd}</button>`;
                     }
                     html += `</div>`;
-                    
                     if (!canSeeData()) {
                         html += `<div class="p-2 text-center space-y-1 bg-[#131722] rounded border border-dashed border-gray-700 text-xs">
                             <p class="text-gray-400 text-[10px]">Для просмотра детальной истории и аналитики необходима активная подписка.</p>
@@ -777,7 +906,6 @@ UI_TEMPLATE = """
             });
             document.getElementById('dealsContainer').innerHTML = html || `<div class="p-8 text-center text-gray-500 text-xs">${i18n[currentLang].noData}</div>`;
         }
-
         function showAllDeals(modalId) {
             let tbody = document.getElementById(modalId + '_tbody');
             if (!tbody) return;
@@ -794,7 +922,6 @@ UI_TEMPLATE = """
                 btnContainer.innerHTML = `<button onclick="event.stopPropagation(); hideAllDeals('${modalId}')" class="btn-show-all">${t.hideAll}</button>`;
             }
         }
-
         function hideAllDeals(modalId) {
             let tbody = document.getElementById(modalId + '_tbody');
             if (!tbody) return;
@@ -817,7 +944,6 @@ UI_TEMPLATE = """
                 }
             }
         }
-
         function toggleSubCurrency(modalId) {
             let btn = document.getElementById(modalId + '_btn');
             let tbody = document.getElementById(modalId + '_tbody');
@@ -827,7 +953,6 @@ UI_TEMPLATE = """
             isShowingUsd = !isShowingUsd;
             btn.setAttribute('data-usd', isShowingUsd);
             btn.innerText = isShowingUsd ? t.btnUzs : t.btnUsd;
-
             tbody.querySelectorAll('tr').forEach(r => {
                 let tds = r.querySelectorAll('td');
                 if (tds.length >= 4) {
@@ -840,12 +965,10 @@ UI_TEMPLATE = """
             let tVal = parseFloat(target.getAttribute('data-val') || 0);
             target.innerText = `${t.targetWin} ` + (isShowingUsd ? fmtUsdOnly(tVal) : Number(tVal).toLocaleString() + ' UZS');
         }
-
         function toggleRow(m) {
             expandedModelKey = (expandedModelKey === m.trim().toLowerCase()) ? null : m.trim().toLowerCase();
             applyFilters();
         }
-
         function applyFilters() {
             let s = document.getElementById('searchInput').value.toLowerCase();
             let filtered = allDeals.filter(d => {
@@ -855,151 +978,11 @@ UI_TEMPLATE = """
             });
             renderTable(filtered);
         }
-
         load();
     </script>
 </body>
 </html>
 """
-
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120000)
-    return f"pbkdf2_sha256$120000${salt}${digest.hex()}"
-
-def verify_password(password: str, stored: str) -> bool:
-    try:
-        scheme, iterations, salt, digest = stored.split("$", 3)
-        if scheme != "pbkdf2_sha256":
-            return secrets.compare_digest(password, stored)
-        check = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iterations))
-        return secrets.compare_digest(check.hex(), digest)
-    except Exception:
-        return False
-
-def send_email(to_email: str, subject: str, body: str):
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_USER
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-        if SMTP_USER == "your_email@gmail.com" and SMTP_PASSWORD == "your_app_password":
-            print(f"\n[DEBUG EMAIL] To: {to_email}\nSubject: {subject}\nBody:\n{body}\n")
-            return True
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, to_email, msg.as_string())
-        server.quit()
-        return True
-    except Exception as e:
-        print(f"Ошибка отправки почты: {e}")
-        return False
-
-def send_telegram(message: str):
-    """Отправляет сообщение в Telegram."""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        response = requests.post(url, json=payload)
-        if response.status_code != 200:
-            print(f"Ошибка Telegram: {response.text}")
-        return response.status_code == 200
-    except Exception as e:
-        print(f"Ошибка отправки в Telegram: {e}")
-        return False
-
-def send_admin_notification(subject: str, body: str):
-    """Отправляет уведомление администратору в Telegram (и email, если настроен)."""
-    send_telegram(f"🔔 <b>{subject}</b>\n\n{body}")
-    send_email(ADMIN_EMAIL, subject, body)
-
-def log_action(username: str, action: str, request: Request):
-    try:
-        conn = get_db_connection()
-        ip = request.client.host if request.client else "unknown"
-        user_agent = request.headers.get("user-agent", "unknown")
-        conn.execute("INSERT INTO user_logs (username, action, ip, user_agent) VALUES (?, ?, ?, ?)",
-                     (username, action, ip, user_agent))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Ошибка логирования: {e}")
-
-def init_db():
-    conn = sqlite3.connect("tender.db")
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS deals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT, date TEXT, model TEXT,
-            quantity INTEGER,
-            start_price REAL, agreed_price REAL,
-            upload_id INTEGER,
-            UNIQUE(date, model, agreed_price)
-        )''')
-    cursor.execute("PRAGMA table_info(deals)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if 'quantity' not in columns:
-        cursor.execute("ALTER TABLE deals ADD COLUMN quantity INTEGER DEFAULT 1")
-    cursor.execute('''CREATE TABLE IF NOT EXISTS uploads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT, category TEXT, rows_count INTEGER, upload_date TEXT
-        )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            email TEXT UNIQUE,
-            password TEXT,
-            role TEXT,
-            expires_at TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS user_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            action TEXT,
-            ip TEXT,
-            user_agent TEXT,
-            timestamp TEXT DEFAULT CURRENT_TIMESTAMP
-        )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS password_resets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT,
-            token TEXT,
-            expires_at TEXT
-        )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS payment_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            months INTEGER,
-            receipt TEXT,
-            status TEXT,
-            created_at TEXT
-        )''')
-    cursor.execute("SELECT COUNT(*) FROM users")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO users (username, email, password, role, expires_at) VALUES (?, ?, ?, ?, ?)",
-                       ("admin", "admin@xarid.uz", hash_password("tender2026"), "admin", "2099-12-31"))
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def get_db_connection():
-    conn = sqlite3.connect("tender.db")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def get_current_user(request: Request):
-    session_user = request.cookies.get("session_user")
-    if not session_user:
-        return None
-    conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE username = ?", (session_user,)).fetchone()
-    conn.close()
-    return user
 
 # ==================== ЭНДПОИНТЫ ====================
 
@@ -1087,9 +1070,9 @@ def check_auth(request: Request):
         except:
             pass
     return {
-        "authenticated": True, 
-        "role": user["role"], 
-        "username": user["username"], 
+        "authenticated": True,
+        "role": user["role"],
+        "username": user["username"],
         "sub_active": sub_active,
         "expires_at": expires_at,
         "days_left": max(0, days_left)
@@ -1098,14 +1081,16 @@ def check_auth(request: Request):
 @app.post("/register")
 async def register_post(username: str = Form(...), email: str = Form(...), password: str = Form(...)):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    existing = cursor.execute("SELECT * FROM users WHERE username = ? OR email = ?", (username, email)).fetchone()
+    cur = execute_query(conn, "SELECT * FROM users WHERE username = ? OR email = ?", (username, email))
+    existing = cur.fetchone()
     if existing:
         conn.close()
         return HTMLResponse("<script>alert('Пользователь с таким логином или email уже существует!'); window.location.href='/';</script>")
     try:
-        cursor.execute("INSERT INTO users (username, email, password, role, expires_at) VALUES (?, ?, ?, 'client', '2026-01-01')",
-                       (username, email, hash_password(password)))
+        execute_query(conn,
+            "INSERT INTO users (username, email, password, role, expires_at) VALUES (?, ?, ?, 'client', '2026-01-01')",
+            (username, email, hash_password(password))
+        )
         conn.commit()
         msg = f"Новая регистрация!\nЛогин: {username}\nE-mail: {email}\nВремя: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         send_admin_notification("Новая регистрация", msg)
@@ -1120,7 +1105,8 @@ async def register_post(username: str = Form(...), email: str = Form(...), passw
 @app.post("/login")
 async def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
     conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    cur = execute_query(conn, "SELECT * FROM users WHERE username = ?", (username,))
+    user = cur.fetchone()
     conn.close()
     if not user or not verify_password(password, user["password"]):
         return HTMLResponse("<script>alert('Неверный логин или пароль!'); window.location.href='/';</script>")
@@ -1132,15 +1118,20 @@ async def login_post(request: Request, username: str = Form(...), password: str 
 @app.post("/api/forgot_password")
 async def forgot_password(request: Request, email: str = Form(...)):
     conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    cur = execute_query(conn, "SELECT * FROM users WHERE email = ?", (email,))
+    user = cur.fetchone()
     if user:
         token = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
         expires_at = (datetime.now() + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute("INSERT INTO password_resets (email, token, expires_at) VALUES (?, ?, ?)", (email, token, expires_at))
+        execute_query(conn,
+            "INSERT INTO password_resets (email, token, expires_at) VALUES (?, ?, ?)",
+            (email, token, expires_at)
+        )
         conn.commit()
         host_url = str(request.base_url).rstrip('/')
         reset_link = f"{host_url}/reset_password?token={token}"
-        send_email(email, "Восстановление пароля — XARID ANALYTICS", f"Перейдите по ссылке для сброса пароля (действительна 15 минут):\n{reset_link}")
+        send_email(email, "Восстановление пароля — XARID ANALYTICS",
+                   f"Перейдите по ссылке для сброса пароля (действительна 15 минут):\n{reset_link}")
     conn.close()
     return HTMLResponse("""
     <!DOCTYPE html>
@@ -1160,7 +1151,8 @@ async def forgot_password(request: Request, email: str = Form(...)):
 @app.get("/reset_password", response_class=HTMLResponse)
 def reset_password_page(token: str):
     conn = get_db_connection()
-    reset_entry = conn.execute("SELECT * FROM password_resets WHERE token = ?", (token,)).fetchone()
+    cur = execute_query(conn, "SELECT * FROM password_resets WHERE token = ?", (token,))
+    reset_entry = cur.fetchone()
     conn.close()
     if not reset_entry:
         return HTMLResponse("<script>alert('Срок действия ссылки истек или она недействительна.'); window.location.href='/';</script>")
@@ -1192,14 +1184,14 @@ def reset_password_page(token: str):
 @app.post("/api/do_reset_password")
 async def do_reset_password(token: str = Form(...), new_password: str = Form(...)):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    reset_entry = cursor.execute("SELECT * FROM password_resets WHERE token = ?", (token,)).fetchone()
+    cur = execute_query(conn, "SELECT * FROM password_resets WHERE token = ?", (token,))
+    reset_entry = cur.fetchone()
     if not reset_entry:
         conn.close()
         return HTMLResponse("<script>alert('Неверный или просроченный токен!'); window.location.href='/';</script>")
     email = reset_entry["email"]
-    cursor.execute("UPDATE users SET password = ? WHERE email = ?", (hash_password(new_password), email))
-    cursor.execute("DELETE FROM password_resets WHERE token = ?", (token,))
+    execute_query(conn, "UPDATE users SET password = ? WHERE email = ?", (hash_password(new_password), email))
+    execute_query(conn, "DELETE FROM password_resets WHERE token = ?", (token,))
     conn.commit()
     conn.close()
     return HTMLResponse("<script>alert('Пароль успешно изменен! Теперь вы можете войти.'); window.location.href='/';</script>")
@@ -1210,10 +1202,11 @@ async def submit_payment(request: Request, months: int = Form(...), receipt: str
     if not user:
         return RedirectResponse(url="/", status_code=303)
     conn = get_db_connection()
-    cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO payment_requests (username, months, receipt, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
-                       (user["username"], months, receipt, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        execute_query(conn,
+            "INSERT INTO payment_requests (username, months, receipt, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+            (user["username"], months, receipt, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
         conn.commit()
         msg = f"Новая заявка на подписку!\nПользователь: {user['username']}\nСрок: {months} месяц(ев)\nЧек: {receipt}\nВремя: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         send_admin_notification("Заявка на подписку", msg)
@@ -1269,7 +1262,8 @@ def get_deals(request: Request):
     if not user:
         return []
     conn = get_db_connection()
-    deals = [dict(row) for row in conn.execute("SELECT * FROM deals").fetchall()]
+    cur = execute_query(conn, "SELECT * FROM deals")
+    deals = [dict(row) for row in cur.fetchall()]
     conn.close()
     return deals
 
@@ -1280,18 +1274,28 @@ def admin_panel(request: Request):
         return RedirectResponse(url="/", status_code=303)
     conn = get_db_connection()
     # Статистика
-    total_logs = conn.execute("SELECT COUNT(*) FROM user_logs").fetchone()[0]
-    unique_today = conn.execute("SELECT COUNT(DISTINCT username) FROM user_logs WHERE date(timestamp) = date('now')").fetchone()[0]
-    unique_week = conn.execute("SELECT COUNT(DISTINCT username) FROM user_logs WHERE timestamp > datetime('now', '-7 days')").fetchone()[0]
-    logs = conn.execute("SELECT * FROM user_logs ORDER BY timestamp DESC LIMIT 20").fetchall()
+    cur = execute_query(conn, "SELECT COUNT(*) FROM user_logs")
+    total_logs = cur.fetchone()[0]
+    cur = execute_query(conn, "SELECT COUNT(DISTINCT username) FROM user_logs WHERE date(timestamp) = date('now')")
+    unique_today = cur.fetchone()[0]
+    cur = execute_query(conn, "SELECT COUNT(DISTINCT username) FROM user_logs WHERE timestamp > datetime('now', '-7 days')")
+    unique_week = cur.fetchone()[0]
+    cur = execute_query(conn, "SELECT * FROM user_logs ORDER BY timestamp DESC LIMIT 20")
+    logs = cur.fetchall()
     
-    new_registrations = conn.execute("SELECT COUNT(*) FROM users WHERE role != 'admin' AND created_at > datetime('now', '-7 days')").fetchone()[0]
-    pending_payments = conn.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'").fetchone()[0]
+    cur = execute_query(conn, "SELECT COUNT(*) FROM users WHERE role != 'admin' AND created_at > datetime('now', '-7 days')")
+    new_registrations = cur.fetchone()[0]
+    cur = execute_query(conn, "SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'")
+    pending_payments = cur.fetchone()[0]
     
-    uploads = conn.execute("SELECT * FROM uploads ORDER BY id DESC").fetchall()
-    users = conn.execute("SELECT * FROM users ORDER BY id DESC").fetchall()
-    pay_requests = conn.execute("SELECT * FROM payment_requests ORDER BY id DESC").fetchall()
-    recent_users = conn.execute("SELECT * FROM users WHERE role != 'admin' ORDER BY id DESC LIMIT 10").fetchall()
+    cur = execute_query(conn, "SELECT * FROM uploads ORDER BY id DESC")
+    uploads = cur.fetchall()
+    cur = execute_query(conn, "SELECT * FROM users ORDER BY id DESC")
+    users = cur.fetchall()
+    cur = execute_query(conn, "SELECT * FROM payment_requests ORDER BY id DESC")
+    pay_requests = cur.fetchall()
+    cur = execute_query(conn, "SELECT * FROM users WHERE role != 'admin' ORDER BY id DESC LIMIT 10")
+    recent_users = cur.fetchall()
     conn.close()
     
     rows = "".join([f"<tr class='border-t border-[#2a2e39]'><td class='p-3'>{u['filename']}</td><td class='p-3 text-cyan-400'>{u['category']}</td><td class='p-3 text-emerald-400 font-bold'>{u['rows_count']}</td><td class='p-3 text-gray-400'>{u['upload_date']}</td><td class='p-3 text-right'><form action='/admin/delete/{u['id']}' method='post'><button class='text-rose-400 hover:text-rose-300 font-bold'>Удалить</button></form></td></tr>" for u in uploads])
@@ -1321,7 +1325,6 @@ def admin_panel(request: Request):
                 <a href="/app" class="text-xs text-cyan-400 hover:underline">← На главную терминала</a>
             </div>
 
-            <!-- Карточки счётчиков -->
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div class="bg-[#1e222d] border border-[#2a2e39] p-4 rounded shadow">
                     <div class="text-gray-400 text-xs uppercase">Новые регистрации (7 дней)</div>
@@ -1341,7 +1344,6 @@ def admin_panel(request: Request):
                 </div>
             </div>
 
-            <!-- Статистика посещений -->
             <div class="grid grid-cols-2 gap-4">
                 <div class="bg-[#1e222d] border border-[#2a2e39] p-4 rounded shadow">
                     <div class="text-gray-400 text-xs uppercase">Уникальных сегодня</div>
@@ -1353,7 +1355,6 @@ def admin_panel(request: Request):
                 </div>
             </div>
 
-            <!-- Таблица логов -->
             <div class="bg-[#1e222d] border border-[#2a2e39] p-6 rounded shadow">
                 <h2 class="text-xs font-semibold uppercase text-gray-400 mb-4">📋 Последние 20 действий</h2>
                 <table class="w-full text-left text-xs">
@@ -1394,7 +1395,7 @@ def admin_panel(request: Request):
                     <button class="w-full bg-cyan-600 hover:bg-cyan-700 py-3 rounded text-xs font-bold uppercase text-white tracking-wider transition shadow">Загрузить в систему</button>
                 </form>
             </div>
-            
+
             <div class="bg-[#1e222d] border border-[#2a2e39] p-6 rounded shadow">
                 <h2 class="text-xs font-semibold uppercase text-gray-400 mb-4">История загрузок</h2>
                 <table class="w-full text-left text-xs">
@@ -1413,11 +1414,12 @@ def approve_payment(req_id: int, request: Request):
     if not user or user["role"] != "admin":
         raise HTTPException(status_code=403)
     conn = get_db_connection()
-    cursor = conn.cursor()
-    req = cursor.execute("SELECT * FROM payment_requests WHERE id = ?", (req_id,)).fetchone()
+    cur = execute_query(conn, "SELECT * FROM payment_requests WHERE id = ?", (req_id,))
+    req = cur.fetchone()
     if req:
         days = int(req["months"]) * 30
-        old_user = cursor.execute("SELECT expires_at FROM users WHERE username = ?", (req["username"],)).fetchone()
+        cur = execute_query(conn, "SELECT expires_at FROM users WHERE username = ?", (req["username"],))
+        old_user = cur.fetchone()
         base_date = datetime.now()
         if old_user and old_user["expires_at"]:
             try:
@@ -1427,10 +1429,9 @@ def approve_payment(req_id: int, request: Request):
             except:
                 pass
         expires_date = (base_date + timedelta(days=days)).strftime("%Y-%m-%d")
-        cursor.execute("UPDATE users SET expires_at = ? WHERE username = ?", (expires_date, req["username"]))
-        cursor.execute("DELETE FROM payment_requests WHERE id = ?", (req_id,))
+        execute_query(conn, "UPDATE users SET expires_at = ? WHERE username = ?", (expires_date, req["username"]))
+        execute_query(conn, "DELETE FROM payment_requests WHERE id = ?", (req_id,))
         conn.commit()
-        # Уведомление в Телеграм
         send_telegram(f"✅ Подписка одобрена для {req['username']} до {expires_date}")
     conn.close()
     return HTMLResponse("<script>alert('Оплата одобрена, подписка успешно продлена!'); window.location.href='/admin';</script>")
@@ -1441,10 +1442,11 @@ def reject_payment(req_id: int, request: Request):
     if not user or user["role"] != "admin":
         raise HTTPException(status_code=403)
     conn = get_db_connection()
-    req = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (req_id,)).fetchone()
+    cur = execute_query(conn, "SELECT * FROM payment_requests WHERE id = ?", (req_id,))
+    req = cur.fetchone()
     if req:
         send_telegram(f"❌ Заявка на подписку отклонена для {req['username']}")
-    conn.execute("DELETE FROM payment_requests WHERE id = ?", (req_id,))
+    execute_query(conn, "DELETE FROM payment_requests WHERE id = ?", (req_id,))
     conn.commit()
     conn.close()
     return HTMLResponse("<script>alert('Заявка удалена.'); window.location.href='/admin';</script>")
@@ -1455,7 +1457,7 @@ def delete_user(user_id: int, request: Request):
     if not user or user["role"] != "admin":
         raise HTTPException(status_code=403)
     conn = get_db_connection()
-    conn.execute("DELETE FROM users WHERE id = ? AND role != 'admin'", (user_id,))
+    execute_query(conn, "DELETE FROM users WHERE id = ? AND role != 'admin'", (user_id,))
     conn.commit()
     conn.close()
     return HTMLResponse("<script>alert('Пользователь удален!'); window.location.href='/admin';</script>")
@@ -1466,13 +1468,19 @@ async def upload_files(category: str = Form(...), files: list[UploadFile] = File
     if not user or user["role"] != "admin":
         raise HTTPException(status_code=403)
     conn = get_db_connection()
-    cursor = conn.cursor()
     for file in files:
         try:
             contents = await file.read()
             df = pd.read_excel(io.BytesIO(contents))
-            cursor.execute('INSERT INTO uploads (filename, category, rows_count, upload_date) VALUES (?, ?, ?, ?)', (file.filename, category, len(df), datetime.now().strftime("%Y-%m-%d")))
-            upload_id = cursor.lastrowid
+            cur = execute_query(conn,
+                "INSERT INTO uploads (filename, category, rows_count, upload_date) VALUES (?, ?, ?, ?)",
+                (file.filename, category, len(df), datetime.now().strftime("%Y-%m-%d"))
+            )
+            if USE_POSTGRES:
+                cur = execute_query(conn, "SELECT lastval()")
+                upload_id = cur.fetchone()[0]
+            else:
+                upload_id = cur.lastrowid
             for _, row in df.iterrows():
                 try:
                     date_val = str(row.iloc[0]).split('T')[0] if pd.notna(row.iloc[0]) else ""
@@ -1481,8 +1489,16 @@ async def upload_files(category: str = Form(...), files: list[UploadFile] = File
                     start_p = float(row.iloc[3]) if len(row) > 3 and pd.notna(row.iloc[3]) else 0.0
                     agreed_p = float(row.iloc[4]) if len(row) > 4 and pd.notna(row.iloc[4]) else 0.0
                     if model_val and model_val.lower() != 'nan':
-                        cursor.execute('INSERT OR IGNORE INTO deals (category, date, model, quantity, start_price, agreed_price, upload_id) VALUES (?, ?, ?, ?, ?, ?, ?)', 
-                                       (category, date_val, model_val, qty_val, start_p, agreed_p, upload_id))
+                        if USE_POSTGRES:
+                            execute_query(conn,
+                                "INSERT INTO deals (category, date, model, quantity, start_price, agreed_price, upload_id) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (date, model, agreed_price) DO NOTHING",
+                                (category, date_val, model_val, qty_val, start_p, agreed_p, upload_id)
+                            )
+                        else:
+                            execute_query(conn,
+                                "INSERT OR IGNORE INTO deals (category, date, model, quantity, start_price, agreed_price, upload_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (category, date_val, model_val, qty_val, start_p, agreed_p, upload_id)
+                            )
                 except Exception as e:
                     print(f"Ошибка строки: {e}")
                     continue
@@ -1498,8 +1514,8 @@ def delete_upload(upload_id: int, request: Request):
     if not user or user["role"] != "admin":
         raise HTTPException(status_code=403)
     conn = get_db_connection()
-    conn.execute("DELETE FROM deals WHERE upload_id = ?", (upload_id,))
-    conn.execute("DELETE FROM uploads WHERE id = ?", (upload_id,))
+    execute_query(conn, "DELETE FROM deals WHERE upload_id = ?", (upload_id,))
+    execute_query(conn, "DELETE FROM uploads WHERE id = ?", (upload_id,))
     conn.commit()
     conn.close()
     return HTMLResponse("<script>alert('Успешно удалено!'); window.location.href='/admin';</script>")
