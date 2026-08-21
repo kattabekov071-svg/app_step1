@@ -1282,27 +1282,46 @@ def admin_panel(request: Request):
     if not user or user["role"] != "admin":
         return RedirectResponse(url="/", status_code=303)
     conn = get_db_connection()
-    # Статистика
-    cur = execute_query(conn, "SELECT COUNT(*) FROM user_logs")
-    total_logs = cur.fetchone()[0]
-    cur = execute_query(conn, "SELECT COUNT(DISTINCT username) FROM user_logs WHERE date(timestamp) = date('now')")
-    unique_today = cur.fetchone()[0]
-    cur = execute_query(conn, "SELECT COUNT(DISTINCT username) FROM user_logs WHERE timestamp > datetime('now', '-7 days')")
-    unique_week = cur.fetchone()[0]
+    
+    # === СТАТИСТИКА (с использованием обычного курсора) ===
+    if USE_POSTGRES:
+        plain_conn = psycopg2.connect(DATABASE_URL)
+        plain_cur = plain_conn.cursor()
+    else:
+        plain_conn = conn
+        plain_cur = conn.cursor()
+    
+    plain_cur.execute("SELECT COUNT(*) FROM user_logs")
+    total_logs = plain_cur.fetchone()[0]
+    
+    plain_cur.execute("SELECT COUNT(DISTINCT username) FROM user_logs WHERE date(timestamp) = date('now')")
+    unique_today = plain_cur.fetchone()[0]
+    
+    plain_cur.execute("SELECT COUNT(DISTINCT username) FROM user_logs WHERE timestamp > datetime('now', '-7 days')")
+    unique_week = plain_cur.fetchone()[0]
+    
+    plain_cur.execute("SELECT COUNT(*) FROM users WHERE role != 'admin' AND created_at > datetime('now', '-7 days')")
+    new_registrations = plain_cur.fetchone()[0]
+    
+    plain_cur.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'")
+    pending_payments = plain_cur.fetchone()[0]
+    
+    if USE_POSTGRES:
+        plain_conn.close()
+    
+    # Остальные запросы (выборка данных) через execute_query
     cur = execute_query(conn, "SELECT * FROM user_logs ORDER BY timestamp DESC LIMIT 20")
     logs = cur.fetchall()
     
-    cur = execute_query(conn, "SELECT COUNT(*) FROM users WHERE role != 'admin' AND created_at > datetime('now', '-7 days')")
-    new_registrations = cur.fetchone()[0]
-    cur = execute_query(conn, "SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'")
-    pending_payments = cur.fetchone()[0]
-    
     cur = execute_query(conn, "SELECT * FROM uploads ORDER BY id DESC")
     uploads = cur.fetchall()
+    
     cur = execute_query(conn, "SELECT * FROM users ORDER BY id DESC")
     users = cur.fetchall()
+    
     cur = execute_query(conn, "SELECT * FROM payment_requests ORDER BY id DESC")
     pay_requests = cur.fetchall()
+    
     cur = execute_query(conn, "SELECT * FROM users WHERE role != 'admin' ORDER BY id DESC LIMIT 10")
     recent_users = cur.fetchall()
     conn.close()
@@ -1426,7 +1445,6 @@ def admin_panel(request: Request):
     </body>
     </html>
     """
-
 @app.post("/admin/approve_payment/{req_id}")
 def approve_payment(req_id: int, request: Request):
     user = get_current_user(request)
