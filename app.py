@@ -1274,29 +1274,38 @@ def get_deals(request: Request):
     deals = [dict(row) for row in cur.fetchall()]
     conn.close()
     return deals
-
-@app.get("/admin", response_class=HTMLResponse)
+ @app.get("/admin", response_class=HTMLResponse)
 def admin_panel(request: Request):
     user = get_current_user(request)
     if not user or user["role"] != "admin":
         return RedirectResponse(url="/", status_code=303)
     conn = get_db_connection()
     
-    # === СТАТИСТИКА (исправленная для PostgreSQL) ===
-    cur = execute_query(conn, "SELECT COUNT(*) AS count FROM user_logs")
-    total_logs = cur.fetchone()["count"]
+    # === СТАТИСТИКА (исправленная) ===
+    if USE_POSTGRES:
+        plain_conn = psycopg2.connect(DATABASE_URL)
+        plain_cur = plain_conn.cursor()
+    else:
+        plain_conn = conn
+        plain_cur = conn.cursor()
     
-    cur = execute_query(conn, "SELECT COUNT(DISTINCT username) AS count FROM user_logs WHERE date(timestamp) = date('now')")
-    unique_today = cur.fetchone()["count"]
+    plain_cur.execute("SELECT COUNT(*) FROM user_logs")
+    total_logs = plain_cur.fetchone()[0]
     
-    cur = execute_query(conn, "SELECT COUNT(DISTINCT username) AS count FROM user_logs WHERE timestamp > datetime('now', '-7 days')")
-    unique_week = cur.fetchone()["count"]
+    plain_cur.execute("SELECT COUNT(DISTINCT username) FROM user_logs WHERE date(timestamp) = date('now')")
+    unique_today = plain_cur.fetchone()[0]
     
-    cur = execute_query(conn, "SELECT COUNT(*) AS count FROM users WHERE role != 'admin' AND created_at > datetime('now', '-7 days')")
-    new_registrations = cur.fetchone()["count"]
+    plain_cur.execute("SELECT COUNT(DISTINCT username) FROM user_logs WHERE timestamp > datetime('now', '-7 days')")
+    unique_week = plain_cur.fetchone()[0]
     
-    cur = execute_query(conn, "SELECT COUNT(*) AS count FROM payment_requests WHERE status = 'pending'")
-    pending_payments = cur.fetchone()["count"]
+    plain_cur.execute("SELECT COUNT(*) FROM users WHERE role != 'admin' AND created_at > datetime('now', '-7 days')")
+    new_registrations = plain_cur.fetchone()[0]
+    
+    plain_cur.execute("SELECT COUNT(*) FROM payment_requests WHERE status = 'pending'")
+    pending_payments = plain_cur.fetchone()[0]
+    
+    if USE_POSTGRES:
+        plain_conn.close()
     
     # Остальные данные
     cur = execute_query(conn, "SELECT * FROM user_logs ORDER BY timestamp DESC LIMIT 20")
@@ -1330,7 +1339,6 @@ def admin_panel(request: Request):
     </tr>""" for pr in pay_requests])
     recent_rows = "".join([f"<tr class='border-t border-[#2a2e39]'><td class='p-3 text-white'>{u['username']}</td><td class='p-3 text-gray-300'>{u['email']}</td><td class='p-3 text-cyan-400'>{u['role']}</td><td class='p-3 text-gray-300'>{u['created_at']}</td></tr>" for u in recent_users])
     
-    # Компактная таблица логов
     log_rows = "".join([f"<tr class='border-t border-[#2a2e39]'><td class='py-1 px-2 text-gray-400 text-[10px]'>{log['timestamp'][:16]}</td><td class='py-1 px-2 text-white text-[10px]'>{log['username'][:12]}</td><td class='py-1 px-2 text-cyan-400 text-[10px]'>{log['action'][:10]}</td><td class='py-1 px-2 text-gray-300 text-[10px]'>{log['ip']}</td><td class='py-1 px-2 text-gray-300 text-[10px]'>{log['user_agent'][:25]}…</td></tr>" for log in logs]) or '<tr><td colspan="5" class="p-4 text-center text-gray-500">Нет записей</td></tr>'
 
     return f"""
@@ -1422,6 +1430,20 @@ def admin_panel(request: Request):
                     <input type="text" name="category" placeholder="Категория (например: Видеонаблюдение / Ноутбуки)" class="w-full bg-[#131722] border border-[#2a2e39] p-3 rounded text-xs text-white outline-none focus:border-cyan-500" required>
                     <input type="file" name="files" accept=".xlsx, .xls" multiple class="w-full text-xs text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:bg-cyan-600 file:text-white cursor-pointer" required>
                     <button class="w-full bg-cyan-600 hover:bg-cyan-700 py-3 rounded text-xs font-bold uppercase text-white tracking-wider transition shadow">Загрузить в систему</button>
+                </form>
+            </div>
+
+            <div class="bg-[#1e222d] border border-[#2a2e39] p-6 rounded shadow">
+                <h2 class="text-xs font-semibold uppercase text-gray-400 mb-4">История загрузок</h2>
+                <table class="w-full text-left text-xs">
+                    <thead><tr class="text-gray-500 border-b border-[#2a2e39]"><th class="pb-3">Файл</th><th class="pb-3">Категория</th><th class="pb-3">Строк</th><th class="pb-3">Дата</th><th class="pb-3 text-right">Действие</th></tr></thead>
+                    <tbody>{rows or '<tr><td colspan="5" class="p-4 text-center text-gray-500">Нет загруженных файлов</td></tr>'}</tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """        <button class="w-full bg-cyan-600 hover:bg-cyan-700 py-3 rounded text-xs font-bold uppercase text-white tracking-wider transition shadow">Загрузить в систему</button>
                 </form>
             </div>
 
