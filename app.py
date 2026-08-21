@@ -27,17 +27,20 @@ SMTP_USER = "your_email@gmail.com"
 SMTP_PASSWORD = "your_app_password"
 ADMIN_EMAIL = "admin@xarid.uz"
 
-TELEGRAM_TOKEN = "8925100564:AAH6GTe281eDfuzoyqBUBm_AhQ31edAscS8"           # ← вставьте свой
-TELEGRAM_CHAT_ID = "40209048"       # ← вставьте свой
+TELEGRAM_TOKEN = "ВАШ_ТОКЕН"           # ← вставьте свой
+TELEGRAM_CHAT_ID = "ВАШ_CHAT_ID"       # ← вставьте свой
 
 # === Определяем, какую БД использовать ===
 DATABASE_URL = os.environ.get("DATABASE_URL")
-USE_POSTGRES = DATABASE_URL is not None
+if DATABASE_URL is None:
+    DATABASE_URL = ""
+USE_POSTGRES = DATABASE_URL.strip() != ""
 
 if USE_POSTGRES:
     import psycopg2
     from psycopg2.extras import RealDictCursor
     logging.info("✅ Используется PostgreSQL")
+    logging.info(f"DATABASE_URL: {DATABASE_URL[:30]}...")  # первые 30 символов для проверки
 else:
     import sqlite3
     logging.info("✅ Используется SQLite (локально)")
@@ -45,6 +48,8 @@ else:
 # === УНИВЕРСАЛЬНАЯ РАБОТА С БАЗОЙ ===
 def get_db_connection():
     if USE_POSTGRES:
+        if not DATABASE_URL:
+            raise Exception("DATABASE_URL is empty, but USE_POSTGRES is True")
         conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
         return conn
     else:
