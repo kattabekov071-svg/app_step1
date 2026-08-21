@@ -4,3 +4,4 @@ pandas
 openpyxl
 requests
 python-multipart
+psycopg2-binary
